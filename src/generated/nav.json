@@ -1,0 +1,228 @@
+{
+  "zh": {
+    "route": "",
+    "title": "Agent-DLC with AgentCore Launchpad：用一个控制台跑通 Agent 开发生命周期",
+    "weight": 0,
+    "children": [
+      {
+        "route": "10-prepare",
+        "title": "开始之前",
+        "weight": 10,
+        "children": [
+          {
+            "route": "10-prepare/10-concepts",
+            "title": "Agent-DLC 方法与 Launchpad 架构",
+            "weight": 10,
+            "children": []
+          },
+          {
+            "route": "10-prepare/20-setup",
+            "title": "环境准备与控制台导览",
+            "weight": 20,
+            "children": []
+          },
+          {
+            "route": "10-prepare/30-roles",
+            "title": "认识角色与职责分离",
+            "weight": 30,
+            "children": []
+          },
+          {
+            "route": "10-prepare/40-teams",
+            "title": "组队与分工",
+            "weight": 40,
+            "children": []
+          }
+        ]
+      },
+      {
+        "route": "20-flywheel",
+        "title": "Agent-DLC 飞轮",
+        "weight": 20,
+        "children": [
+          {
+            "route": "20-flywheel/10-define",
+            "title": "阶段一 · 定义：把需求变成可测标准",
+            "weight": 10,
+            "children": []
+          },
+          {
+            "route": "20-flywheel/20-build",
+            "title": "阶段二 · 构建：创建、部署并武装 Agent",
+            "weight": 20,
+            "children": []
+          },
+          {
+            "route": "20-flywheel/30-evaluate",
+            "title": "阶段三 · 评估：证明它达标",
+            "weight": 30,
+            "children": []
+          },
+          {
+            "route": "20-flywheel/40-release",
+            "title": "阶段四 · 发布：安全地上线",
+            "weight": 40,
+            "children": []
+          },
+          {
+            "route": "20-flywheel/50-observe",
+            "title": "阶段五 · 观测：看清线上发生了什么",
+            "weight": 50,
+            "children": []
+          },
+          {
+            "route": "20-flywheel/60-feedback",
+            "title": "阶段六 · 回流：让下一轮更强",
+            "weight": 60,
+            "children": []
+          }
+        ]
+      },
+      {
+        "route": "30-wrap-up",
+        "title": "实战与收尾",
+        "weight": 30,
+        "children": [
+          {
+            "route": "30-wrap-up/10-team-lab",
+            "title": "分组实战：把你的 Agent 带上飞轮",
+            "weight": 10,
+            "children": []
+          },
+          {
+            "route": "30-wrap-up/20-cleanup",
+            "title": "收尾与资源清理",
+            "weight": 20,
+            "children": []
+          }
+        ]
+      },
+      {
+        "route": "90-appendix",
+        "title": "附录：组织方",
+        "weight": 90,
+        "children": [
+          {
+            "route": "90-appendix/10-organizer-deploy",
+            "title": "组织方部署指南",
+            "weight": 10,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  "en": {
+    "route": "",
+    "title": "Agent-DLC with AgentCore Launchpad: Run the Agent Development Lifecycle from One Console",
+    "weight": 0,
+    "children": [
+      {
+        "route": "10-prepare",
+        "title": "Before You Start",
+        "weight": 10,
+        "children": [
+          {
+            "route": "10-prepare/10-concepts",
+            "title": "Agent-DLC Method and Launchpad Architecture",
+            "weight": 10,
+            "children": []
+          },
+          {
+            "route": "10-prepare/20-setup",
+            "title": "Environment Setup and Console Tour",
+            "weight": 20,
+            "children": []
+          },
+          {
+            "route": "10-prepare/30-roles",
+            "title": "Roles and Separation of Duties",
+            "weight": 30,
+            "children": []
+          },
+          {
+            "route": "10-prepare/40-teams",
+            "title": "Teams and Roles",
+            "weight": 40,
+            "children": []
+          }
+        ]
+      },
+      {
+        "route": "20-flywheel",
+        "title": "The Agent-DLC Flywheel",
+        "weight": 20,
+        "children": [
+          {
+            "route": "20-flywheel/10-define",
+            "title": "Phase 1 · Define: Turn Requirements into a Measurable Standard",
+            "weight": 10,
+            "children": []
+          },
+          {
+            "route": "20-flywheel/20-build",
+            "title": "Phase 2 · Build: Create, Deploy and Equip the Agent",
+            "weight": 20,
+            "children": []
+          },
+          {
+            "route": "20-flywheel/30-evaluate",
+            "title": "Phase 3 · Evaluate: Prove It Meets the Bar",
+            "weight": 30,
+            "children": []
+          },
+          {
+            "route": "20-flywheel/40-release",
+            "title": "Phase 4 · Release: Ship It Safely",
+            "weight": 40,
+            "children": []
+          },
+          {
+            "route": "20-flywheel/50-observe",
+            "title": "Phase 5 · Observe: See What Is Happening in Production",
+            "weight": 50,
+            "children": []
+          },
+          {
+            "route": "20-flywheel/60-feedback",
+            "title": "Phase 6 · Feed Back: Make the Next Round Stronger",
+            "weight": 60,
+            "children": []
+          }
+        ]
+      },
+      {
+        "route": "30-wrap-up",
+        "title": "Team Lab and Wrap-up",
+        "weight": 30,
+        "children": [
+          {
+            "route": "30-wrap-up/10-team-lab",
+            "title": "Team Lab: Put Your Own Agent on the Flywheel",
+            "weight": 10,
+            "children": []
+          },
+          {
+            "route": "30-wrap-up/20-cleanup",
+            "title": "Wrap-up and Cleanup",
+            "weight": 20,
+            "children": []
+          }
+        ]
+      },
+      {
+        "route": "90-appendix",
+        "title": "Appendix: for the Organiser",
+        "weight": 90,
+        "children": [
+          {
+            "route": "90-appendix/10-organizer-deploy",
+            "title": "Organizer deployment guide",
+            "weight": 10,
+            "children": []
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,896 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Agent-DLC with AgentCore Launchpad workshop host: an ARM64 Ubuntu Server 24.04 LTS
+  EC2 instance running the multi-user Launchpad console behind CloudFront, seeded with
+  admin, developer, business-owner, release-operator and SME accounts.
+
+Parameters:
+  ParticipantRoleArn:
+    Type: String
+    Default: ""
+    Description: >
+      Leave empty when you deploy the stack yourself: the stack then creates the
+      instance role. Only a Workshop Studio-provisioned account passes its
+      participant role ARN here.
+    AllowedPattern: "^$|^arn:aws:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$"
+  GitRepositoryUrl:
+    Type: String
+    Default: https://github.com/aws-samples/sample-agentcore-launchpad.git
+    Description: Public HTTPS Git repository containing the AgentCore Launchpad lab.
+    AllowedPattern: "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\\.git)?$"
+  GitBranch:
+    Type: String
+    Default: console-v3
+    Description: Git branch or tag to check out (console-v3 carries the V3 console and Agent-DLC). Pin a tag for a scheduled event.
+    AllowedPattern: "^[A-Za-z0-9._/-]+$"
+  SelfRegistration:
+    Type: String
+    Default: Enabled
+    AllowedValues:
+      - Enabled
+      - Disabled
+    Description: >
+      Enabled keeps console self-registration open, with every new account held
+      pending until an admin approves it (the lab walks through that approval).
+      Disabled closes registration once the seeded accounts exist.
+  InstanceType:
+    Type: String
+    Default: m9g.xlarge
+    Description: >
+      Graviton (arm64) xlarge instance type for the workshop host, 4 vCPU and
+      16 GiB each. m9g.xlarge is the default; the older generations are
+      fallbacks for an Availability Zone that does not offer it (in us-east-1,
+      m9g.xlarge is not offered in us-east-1e or us-east-1f).
+    AllowedValues:
+      - m9g.xlarge
+      - m8g.xlarge
+      - m7g.xlarge
+      - m6g.xlarge
+  RootVolumeSize:
+    Type: Number
+    Default: 80
+    MinValue: 40
+    MaxValue: 200
+    Description: Root EBS volume size in GiB.
+  # Plain String rather than AWS::EC2::VPC::Id / AWS::EC2::Subnet::Id: the
+  # AWS-specific types reject an empty value, and empty is how "create the
+  # network" is selected. The cost is that CloudFormation cannot check up front
+  # that the subnet belongs to the VPC (Fn::ValueOf needs those types).
+  ExistingVpcId:
+    Type: String
+    Default: ""
+    Description: >
+      Leave empty to let the stack create its own VPC, public subnet, internet
+      gateway and route table. To deploy into an existing VPC instead, give its
+      id here (DNS hostnames and DNS resolution must both be enabled) and set
+      ExistingSubnetId too.
+    AllowedPattern: "^$|^vpc-[0-9a-f]{8,17}$"
+    ConstraintDescription: Empty, or a VPC id such as vpc-0123456789abcdef0.
+  ExistingSubnetId:
+    Type: String
+    Default: ""
+    Description: >
+      Required when ExistingVpcId is set, empty otherwise. A public subnet of
+      that VPC: its route table sends 0.0.0.0/0 to an internet gateway, and its
+      Availability Zone offers the chosen InstanceType. The instance gets a
+      public IPv4 address regardless of the subnet's auto-assign setting.
+    AllowedPattern: "^$|^subnet-[0-9a-f]{8,17}$"
+    ConstraintDescription: Empty, or a subnet id such as subnet-0123456789abcdef0.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Workshop
+        Parameters:
+          - ParticipantRoleArn
+          - GitRepositoryUrl
+          - GitBranch
+          - SelfRegistration
+      - Label:
+          default: Instance
+        Parameters:
+          - InstanceType
+          - RootVolumeSize
+      - Label:
+          default: Network (optional)
+        Parameters:
+          - ExistingVpcId
+          - ExistingSubnetId
+    ParameterLabels:
+      ExistingVpcId:
+        default: Existing VPC id (leave empty to create a new VPC)
+      ExistingSubnetId:
+        default: Existing public subnet id (required with an existing VPC)
+
+Rules:
+  ExistingNetworkIsComplete:
+    Assertions:
+      - Assert: !Or
+          - !And
+            - !Equals [!Ref ExistingVpcId, ""]
+            - !Equals [!Ref ExistingSubnetId, ""]
+          - !And
+            - !Not [!Equals [!Ref ExistingVpcId, ""]]
+            - !Not [!Equals [!Ref ExistingSubnetId, ""]]
+        # Single-line plain scalar: a folded block would put a trailing newline
+        # into the stack event message.
+        AssertDescription: Set ExistingVpcId and ExistingSubnetId together (deploy into an existing VPC), or leave both empty (the stack creates its own network).
+
+Conditions:
+  CreateInstanceRole: !Equals [!Ref ParticipantRoleArn, ""]
+  CreateVpc: !Equals [!Ref ExistingVpcId, ""]
+
+Mappings:
+  # com.amazonaws.global.cloudfront.origin-facing, so port 80 on the instance is
+  # reachable from CloudFront edges only and not from the open internet. The id
+  # is per-region and there is no pseudo-parameter for it, so the two regions
+  # this workshop deploys to are mapped explicitly.
+  CloudFrontPrefixList:
+    us-east-1:
+      Id: pl-3b927c52
+    us-west-2:
+      Id: pl-82a045eb
+
+Resources:
+  # Every network resource below carries Condition CreateVpc: with
+  # ExistingVpcId/ExistingSubnetId set, the stack creates none of them and
+  # deleting the stack leaves the existing VPC untouched.
+  WorkshopVpc:
+    Type: AWS::EC2::VPC
+    Condition: CreateVpc
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateVpc
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateVpc
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref WorkshopVpc
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.42.0.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref WorkshopVpc
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop-public
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref WorkshopVpc
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop-public
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVpc
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  WorkshopSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      # Must stay a single-line plain scalar. A YAML folded block (`>`) keeps one
+      # trailing newline, and EC2 rejects a newline in a group description with
+      # "Invalid security group description".
+      GroupDescription: CloudFront-only inbound on port 80 for the Launchpad console, plus egress.
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !FindInMap [CloudFrontPrefixList, !Ref "AWS::Region", Id]
+          Description: CloudFront edge locations only
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: Package downloads and AWS API access
+      VpcId: !If [CreateVpc, !Ref WorkshopVpc, !Ref ExistingVpcId]
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop
+
+  # The bootstrap needs the internet from its first command, so the instance
+  # must wait for the default route when the stack builds the network. A plain
+  # DependsOn cannot name a resource whose condition is false; this free,
+  # never-signalled handle carries that dependency only when CreateVpc holds.
+  NetworkReady:
+    Type: AWS::CloudFormation::WaitConditionHandle
+    Metadata:
+      DefaultRoute: !If [CreateVpc, !Ref DefaultRoute, ""]
+      RouteTableAssociation: !If [CreateVpc, !Ref PublicSubnetRouteTableAssociation, ""]
+
+  # CloudFront gives the console a trusted HTTPS name with no certificate to
+  # manage. It is not an optimisation: prod mode marks the session cookie
+  # `Secure`, so the login gate cannot work over plain HTTP at all.
+  #
+  # Three standard CloudFront checks are knowingly not satisfied here:
+  #
+  # * Viewer certificate minimum TLS. Using the `*.cloudfront.net` name means
+  #   `CloudFrontDefaultCertificate: true`, and CloudFront then pins the security
+  #   policy to `TLSv1` and ignores any `MinimumProtocolVersion` given. Raising it
+  #   requires an alternate domain name plus an ACM certificate, which this
+  #   template does not set up. Not fixable at this layer.
+  # * Access logging. Would add a per-team log bucket, and CloudFront standard
+  #   logging needs S3 ACLs re-enabled (`ObjectOwnership: BucketOwnerPreferred`)
+  #   against current S3 defaults. Skipped: the account is torn down with the
+  #   event, and the bootstrap already runs close to its PT45M signal budget.
+  # * WAF. A billed WebACL in front of a password-gated console in a throwaway
+  #   account buys little; the origin is already closed to everything but this
+  #   distribution.
+  ConsoleDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "AgentCore Launchpad console (${AWS::StackName})"
+        # PriceClass_100 keeps edges in NA/EU. The origin is a single instance in
+        # one region either way, so more edges buys nothing here.
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        Origins:
+          - Id: launchpad-instance
+            DomainName: !GetAtt WorkshopInstance.PublicDnsName
+            CustomOriginConfig:
+              # http-only: there is no certificate on the instance. The hop from
+              # the edge to the origin is cleartext inside AWS, which is why the
+              # security group admits CloudFront ranges only and nginx demands
+              # the secret header below.
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 5
+            OriginCustomHeaders:
+              - HeaderName: X-Launchpad-Origin-Key
+                HeaderValue: !Join
+                  - ""
+                  - - !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+                    - !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+                    - !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        DefaultCacheBehavior:
+          TargetOriginId: launchpad-instance
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # Managed-CachingDisabled: the console is entirely dynamic, and caching
+          # an authenticated response at the edge would serve one participant's
+          # session to the next viewer.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Managed-AllViewer: forwards every header, cookie and query string,
+          # which the session cookie and SSE streams both need.
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+
+  # Created only when the customer deploys the stack (no ParticipantRoleArn): the
+  # same permissions Workshop Studio grants its participant role
+  # (static/iam/participant-policy.json), plus the SSM core policy so the
+  # organiser can open a shell for troubleshooting. Participants never use it —
+  # they only open ConsoleUrl in a browser.
+  WorkshopInstanceRole:
+    Type: AWS::IAM::Role
+    Condition: CreateInstanceRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: agentcore-launchpad-workshop
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {"Sid": "AccountAndResourceDiscovery", "Effect": "Allow", "Action": ["sts:GetCallerIdentity", "ec2:Describe*", "iam:Get*", "iam:List*", "iam:SimulatePrincipalPolicy", "resource-groups:Get*", "resource-groups:List*", "tag:GetResources", "tag:GetTagKeys", "tag:GetTagValues"], "Resource": "*"}
+              - {"Sid": "AgentCoreAndBedrock", "Effect": "Allow", "Action": ["bedrock:*", "bedrock-agentcore:*", "agent-registry:*"], "Resource": "*"}
+              - {"Sid": "SubscribeBedrockMarketplaceModels", "Effect": "Allow", "Action": ["aws-marketplace:ViewSubscriptions", "aws-marketplace:Subscribe"], "Resource": "*"}
+              - {"Sid": "BedrockMantleInference", "Effect": "Allow", "Action": ["bedrock-mantle:Get*", "bedrock-mantle:List*", "bedrock-mantle:CreateInference"], "Resource": "arn:aws:bedrock-mantle:*:*:project/*"}
+              - {"Sid": "BedrockMantleCallWithBearerToken", "Effect": "Allow", "Action": ["bedrock-mantle:CallWithBearerToken"], "Resource": "*"}
+              - {"Sid": "LaunchpadSupportingServices", "Effect": "Allow", "Action": ["apigateway:*", "application-autoscaling:Describe*", "application-signals:*", "autoscaling:Describe*", "cloudformation:*", "cloudtrail:CreateServiceLinkedChannel", "cloudwatch:*", "cognito-idp:*", "codebuild:*", "dynamodb:*", "events:*", "lambda:*", "logs:*", "oam:ListSinks", "rum:Get*", "rum:List*", "secretsmanager:*", "sqs:*", "synthetics:Describe*", "synthetics:Get*", "xray:*"], "Resource": "*"}
+              - {"Sid": "LaunchpadAndCdkBuckets", "Effect": "Allow", "Action": "s3:*", "Resource": ["arn:aws:s3:::launchpad-*", "arn:aws:s3:::bedrock-agentcore-gateway-*", "arn:aws:s3:::bedrock-agentcore-runtime-*", "arn:aws:s3:::cdk-*"]}
+              - {"Sid": "S3Discovery", "Effect": "Allow", "Action": ["s3:GetAccountPublicAccessBlock", "s3:ListAllMyBuckets"], "Resource": "*"}
+              - {"Sid": "LaunchpadAndCdkEcr", "Effect": "Allow", "Action": "ecr:*", "Resource": ["arn:aws:ecr:*:*:repository/launchpad-*", "arn:aws:ecr:*:*:repository/cdk-*"]}
+              - {"Sid": "EcrAuthentication", "Effect": "Allow", "Action": "ecr:GetAuthorizationToken", "Resource": "*"}
+              - {"Sid": "ManageLaunchpadAndCdkRoles", "Effect": "Allow", "Action": ["iam:AddRoleToInstanceProfile", "iam:AttachRolePolicy", "iam:CreateInstanceProfile", "iam:CreatePolicy", "iam:CreatePolicyVersion", "iam:CreateRole", "iam:DeleteInstanceProfile", "iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:DeleteRole", "iam:DeleteRolePolicy", "iam:DetachRolePolicy", "iam:PutRolePolicy", "iam:RemoveRoleFromInstanceProfile", "iam:SetDefaultPolicyVersion", "iam:TagInstanceProfile", "iam:TagPolicy", "iam:TagRole", "iam:UntagInstanceProfile", "iam:UntagPolicy", "iam:UntagRole", "iam:UpdateAssumeRolePolicy", "iam:UpdateRole", "iam:UpdateRoleDescription"], "Resource": ["arn:aws:iam::*:instance-profile/launchpad-*", "arn:aws:iam::*:instance-profile/cdk-*", "arn:aws:iam::*:instance-profile/hnb659fds-*", "arn:aws:iam::*:policy/launchpad-*", "arn:aws:iam::*:policy/cdk-*", "arn:aws:iam::*:policy/hnb659fds-*", "arn:aws:iam::*:role/launchpad-*", "arn:aws:iam::*:role/cdk-*", "arn:aws:iam::*:role/hnb659fds-*"]}
+              - {"Sid": "AssumeCdkBootstrapRoles", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": ["arn:aws:iam::*:role/cdk-hnb659fds-*"]}
+              - {"Sid": "PassLaunchpadAndCdkRolesToRequiredServices", "Effect": "Allow", "Action": "iam:PassRole", "Resource": ["arn:aws:iam::*:role/launchpad-*", "arn:aws:iam::*:role/cdk-*", "arn:aws:iam::*:role/hnb659fds-*"], "Condition": {"StringEquals": {"iam:PassedToService": ["bedrock.amazonaws.com", "bedrock-agentcore.amazonaws.com", "cloudformation.amazonaws.com", "codebuild.amazonaws.com", "lambda.amazonaws.com"]}}}
+              - {"Sid": "CreateRequiredServiceLinkedRoles", "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*", "Condition": {"StringLike": {"iam:AWSServiceName": ["agent-registry.amazonaws.com", "application-signals.cloudwatch.amazonaws.com", "bedrock-agentcore.amazonaws.com", "identity-network.bedrock-agentcore.amazonaws.com", "network.bedrock-agentcore.amazonaws.com", "runtime-identity.bedrock-agentcore.amazonaws.com"]}}}
+              - {"Sid": "AgentCoreEncryption", "Effect": "Allow", "Action": ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey", "kms:ListAliases", "kms:ListKeys"], "Resource": "*"}
+              - {"Sid": "ReadUbuntuAmiParameter", "Effect": "Allow", "Action": ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"], "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id"}
+              - {"Sid": "ManageCdkBootstrapParameter", "Effect": "Allow", "Action": ["ssm:AddTagsToResource", "ssm:DeleteParameter", "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:ListTagsForResource", "ssm:PutParameter", "ssm:RemoveTagsFromResource"], "Resource": "arn:aws:ssm:*:*:parameter/cdk-bootstrap/*"}
+              - {"Sid": "UseSessionManager", "Effect": "Allow", "Action": ["ssm:DescribeInstanceInformation", "ssm:ResumeSession", "ssm:StartSession", "ssm:TerminateSession"], "Resource": "*"}
+              - {"Sid": "SsmManagedInstance", "Effect": "Allow", "Action": ["ec2messages:AcknowledgeMessage", "ec2messages:DeleteMessage", "ec2messages:FailMessage", "ec2messages:GetEndpoint", "ec2messages:GetMessages", "ec2messages:SendReply", "ssm:UpdateInstanceInformation", "ssmmessages:CreateControlChannel", "ssmmessages:CreateDataChannel", "ssmmessages:OpenControlChannel", "ssmmessages:OpenDataChannel"], "Resource": "*"}
+
+  ParticipantInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !If
+          - CreateInstanceRole
+          - !Ref WorkshopInstanceRole
+          - !Select [1, !Split ["/", !Ref ParticipantRoleArn]]
+
+  TransactionSearchLogsPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: AgentCoreLaunchpadTransactionSearch
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TransactionSearchXRayAccess
+            Effect: Allow
+            Principal:
+              Service: xray.amazonaws.com
+            Action: logs:PutLogEvents
+            Resource:
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*"
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/application-signals/data:*"
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:xray:${AWS::Region}:${AWS::AccountId}:*"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  WorkshopInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      # W1030: cfn-lint checks the ExistingSubnetId branch of the SubnetId !If
+      # against the parameter's empty default. That branch is only taken when
+      # ExistingVpcId is set, and Rules.ExistingNetworkIsComplete then requires
+      # ExistingSubnetId to be set as well.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1030
+    DependsOn:
+      - NetworkReady
+      - TransactionSearchLogsPolicy
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT45M
+    Properties:
+      IamInstanceProfile: !Ref ParticipantInstanceProfile
+      ImageId: "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id}}"
+      InstanceType: !Ref InstanceType
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpPutResponseHopLimit: 1
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: true
+            Encrypted: true
+            VolumeSize: !Ref RootVolumeSize
+            VolumeType: gp3
+      # AssociatePublicIpAddress makes the public IPv4 (and with it the
+      # PublicDnsName that CloudFront uses as origin) independent of the
+      # subnet's MapPublicIpOnLaunch, which matters for an existing subnet.
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: "0"
+          GroupSet:
+            - !Ref WorkshopSecurityGroup
+          SubnetId: !If [CreateVpc, !Ref PublicSubnet, !Ref ExistingSubnetId]
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop
+        - Key: Workshop
+          Value: agentcore-launchpad
+      # NOTE: EC2 caps encoded UserData at 25600 bytes and this script runs close
+      # to that ceiling. Explanation belongs in these YAML comments, which cost
+      # nothing, rather than inside the script, which is measured. Check the
+      # headroom before adding to it.
+      #
+      # Publishing the console, in order:
+      #  1. Derive two secrets from the stack id. They are derived rather than
+      #     generated because CloudFormation cannot hand a generated value to both
+      #     a resource property and a participant-visible Output. The stack id is
+      #     unique per team, so each team gets its own pair. The password
+      #     derivation here must stay in step with the ConsolePassword output.
+      #  2. Build the frontend, because vite preview serves frontend/dist.
+      #  3. Run backend and frontend under systemd, both bound to loopback. The
+      #     credentials go in /etc/launchpad-auth.env at 0600 and reach the unit
+      #     through EnvironmentFile, so they never sit in a 0644 unit file.
+      #     LAUNCHPAD_AUTH_COOKIE_SECURE=true because TLS terminates at CloudFront;
+      #     Registration stays on with REQUIRE_APPROVAL=true: the seeding step
+      #     needs /api/auth/register, and the lab shows an admin approving a
+      #     pending account. A pending account cannot hold a session, so the
+      #     public URL alone grants nothing. SelfRegistration=Disabled turns it
+      #     off again once seeding is done.
+      #  4. Put nginx in front, refusing anything without the header CloudFront
+      #     injects, so the instance cannot be reached around the distribution.
+      #  5. Fail the stack unless the console answers locally AND reports
+      #     auth_required, so a successful stack cannot have published an open
+      #     console.
+      #  6. Seed the workshop accounts through the same API the console uses
+      #     (login as admin -> register -> PATCH active/role/permissions/grant on
+      #     the default workspace, never expiring). Passwords derive from the
+      #     stack id like the admin's; each derivation must stay in step with its
+      #     *Password output. Roles follow backend/scripts/e2e_agent_dlc.py:
+      #     separation of duties is checked by username, so each sign-off step
+      #     needs a different account from the one that requested it.
+      #
+      # The model probe fails the stack only when no Bedrock Converse model
+      # answers, since GLM-5.3 (every lab agent) and GPT-6 Sol (every evaluator
+      # judge) both ride Converse, so nothing in the content works. A single
+      # missing model is a loud warning instead: the participant still gets a
+      # usable environment and the facilitator can substitute, whereas failing
+      # would leave them nothing. When glm-5.3, gpt-6-sol or claude-sonnet-5 is
+      # unavailable, scripts/switch_models.py then probes substitutes for every
+      # model the platform itself calls (judge, intents, actor, ...) and writes
+      # them to /etc/launchpad-models.env before the backend first starts. It is
+      # best effort (|| ...): its outcome lands in MODEL-ACCESS.txt and can never
+      # fail the stack. An admin can still change any of them later on the
+      # console's Models page, which takes precedence over that file.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -Eeuo pipefail
+          exec > >(tee /var/log/workshop-bootstrap.log | logger -t workshop-bootstrap -s 2>/dev/console) 2>&1
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y ca-certificates curl unzip
+
+          curl --fail --location --silent --show-error \
+            https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip \
+            --output /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp
+          /tmp/aws/install
+
+          IMDS_TOKEN="$(curl --fail --silent --show-error --retry 10 \
+            --request PUT \
+            --header 'X-aws-ec2-metadata-token-ttl-seconds: 21600' \
+            http://169.254.169.254/latest/api/token)"
+          INSTANCE_ID="$(curl --fail --silent --show-error --retry 10 \
+            --header "X-aws-ec2-metadata-token: ${!IMDS_TOKEN}" \
+            http://169.254.169.254/latest/meta-data/instance-id)"
+
+          signal_stack() {
+            AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=10 \
+              aws cloudformation signal-resource \
+                --stack-name "${AWS::StackName}" \
+                --logical-resource-id WorkshopInstance \
+                --unique-id "$INSTANCE_ID" \
+                --status "$1" \
+                --region "${AWS::Region}"
+          }
+          signal_failure() {
+            signal_stack FAILURE || true
+          }
+          trap signal_failure ERR
+
+          curl --fail --location --silent --show-error \
+            https://deb.nodesource.com/setup_22.x \
+            --output /tmp/nodesource-setup.sh
+          bash /tmp/nodesource-setup.sh
+
+          apt-get install -y \
+            build-essential \
+            docker.io \
+            git \
+            gzip \
+            jq \
+            make \
+            nodejs \
+            libssl-dev \
+            python3 \
+            python3-dev \
+            tar \
+            unzip
+
+          if snap list amazon-ssm-agent >/dev/null 2>&1; then
+            snap start --enable amazon-ssm-agent
+          else
+            curl --fail --location --silent --show-error \
+              "https://s3.${AWS::Region}.amazonaws.com/amazon-ssm-${AWS::Region}/latest/debian_arm64/amazon-ssm-agent.deb" \
+              --output /tmp/amazon-ssm-agent.deb
+            dpkg -i /tmp/amazon-ssm-agent.deb
+            systemctl enable --now amazon-ssm-agent
+          fi
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          curl --fail --location --silent --show-error \
+            https://astral.sh/uv/install.sh \
+            --output /tmp/install-uv.sh
+          UV_INSTALL_DIR=/usr/local/bin sh /tmp/install-uv.sh
+          npm install --global aws-cdk
+
+          install -d -o ubuntu -g ubuntu /home/ubuntu/agentcore_launchpad
+          rm -rf /home/ubuntu/agentcore_launchpad
+          runuser -u ubuntu -- \
+            git clone --depth 1 --branch "${GitBranch}" \
+            "${GitRepositoryUrl}" /home/ubuntu/agentcore_launchpad
+
+          apt-get install -y nginx
+
+          cat >/etc/profile.d/agentcore-workshop.sh <<'PROFILE'
+          export AWS_REGION=${AWS::Region}
+          export AWS_DEFAULT_REGION=${AWS::Region}
+          # The app's Settings uses env_prefix="LAUNCHPAD_" and hardcodes
+          # region="us-west-2", so AWS_REGION does NOT reach it. Without this the
+          # backend reads us-west-2 while every AWS SDK call around it uses the
+          # event's real region.
+          export LAUNCHPAD_REGION=${AWS::Region}
+          export AGENTCORE_LAUNCHPAD_HOME=/home/ubuntu/agentcore_launchpad
+          PROFILE
+          chmod 0644 /etc/profile.d/agentcore-workshop.sh
+
+          echo "Installing project dependencies and prewarming AgentCore resources..."
+          runuser -u ubuntu -- env \
+            HOME=/home/ubuntu \
+            PATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin \
+            AWS_REGION="${AWS::Region}" \
+            AWS_DEFAULT_REGION="${AWS::Region}" \
+            LAUNCHPAD_REGION="${AWS::Region}" \
+            bash -c '
+              set -Eeuo pipefail
+              cd /home/ubuntu/agentcore_launchpad
+              (cd backend && uv sync)
+              (cd frontend && npm install)
+              (cd infra && uv sync)
+
+              ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+              printf -v CDK_ENV "aws://%s/%s" "$ACCOUNT_ID" "$AWS_REGION"
+              cdk bootstrap "$CDK_ENV"
+              make bootstrap
+
+              TRANSACTION_SEARCH_STATUS=""
+              for _ in $(seq 1 120); do
+                TRANSACTION_SEARCH_STATUS="$(aws xray get-trace-segment-destination \
+                  --query Status --output text)"
+                if [[ "$TRANSACTION_SEARCH_STATUS" == "ACTIVE" ]]; then
+                  break
+                fi
+                sleep 5
+              done
+              if [[ "$TRANSACTION_SEARCH_STATUS" != "ACTIVE" ]]; then
+                echo "Transaction Search did not become ACTIVE" >&2
+                exit 1
+              fi
+
+              chmod 0600 config/launchpad.yaml
+            '
+
+          echo "Probing model access for the workshop models..."
+          MODEL_REPORT=/home/ubuntu/MODEL-ACCESS.txt
+          : >"$MODEL_REPORT"
+          cat >>"$MODEL_REPORT" <<HEADER
+          # Bedrock Converse, probed by a real invoke in ${AWS::Region}.
+          # global.zai.glm-5.3 runs lab-service-assistant and lab-policy-advisor;
+          # global.openai.gpt-6-sol is the judge of every evaluator. A Claude id
+          # is needed only by the optional container path.
+          HEADER
+
+          for MODEL_ID in global.zai.glm-5.3 global.openai.gpt-6-sol global.anthropic.claude-sonnet-5 global.anthropic.claude-sonnet-4-6; do
+            MODEL_OK=no
+            for ATTEMPT in $(seq 1 9); do
+              if aws bedrock-runtime converse \
+                   --region "${AWS::Region}" \
+                   --model-id "${!MODEL_ID}" \
+                   --messages '[{"role":"user","content":[{"text":"ping"}]}]' \
+                   --inference-config '{"maxTokens":16}' \
+                   >/dev/null 2>/tmp/model-ping.err; then
+                MODEL_OK=yes
+                break
+              fi
+              if [ "${!ATTEMPT}" -eq 1 ]; then
+                echo "First call to ${!MODEL_ID} failed; retrying. See /tmp/model-ping.err."
+              fi
+              sleep 20
+            done
+            if [ "${!MODEL_OK}" = yes ]; then
+              echo "available    [bedrock]  ${!MODEL_ID}" >>"$MODEL_REPORT"
+            else
+              echo "unavailable  [bedrock]  ${!MODEL_ID}" >>"$MODEL_REPORT"
+              sed -e 's/^/    /' /tmp/model-ping.err >&2 || true
+            fi
+          done
+
+          chown ubuntu:ubuntu "$MODEL_REPORT"
+          # Fail only when no model answers at all. See YAML note.
+          if ! grep -q '^available ' "$MODEL_REPORT"; then
+            echo "No workshop model is invocable in this account; the lab cannot run." >&2
+            signal_failure
+            exit 1
+          fi
+          if ! grep -q '^available    \[bedrock\]  global.zai.glm-5.3' "$MODEL_REPORT"; then
+            echo "WARNING: glm-5.3 unavailable. The lab agents use it; name a substitute or move region." >&2
+          fi
+          if ! grep -q '^available    \[bedrock\]  global.openai.gpt-6-sol' "$MODEL_REPORT"; then
+            echo "WARNING: gpt-6-sol unavailable. Evaluator judges use it; pick another judge model." >&2
+          fi
+          if ! grep -q '^available    \[bedrock\]  global.anthropic' "$MODEL_REPORT"; then
+            echo "WARNING: no Anthropic model. The optional container path deploys but cannot chat." >&2
+          fi
+
+          # A default model is unavailable: let scripts/switch_models.py pick
+          # working substitutes for the platform's own model settings. See the
+          # YAML note above UserData. It writes /etc/launchpad-models.env, which
+          # the backend unit below loads (the backend is not started yet, so no
+          # restart is needed), and appends its report to MODEL-ACCESS.txt.
+          if grep -Eq '^unavailable +\[bedrock\] +global\.(zai\.glm-5\.3|openai\.gpt-6-sol|anthropic\.claude-sonnet-5)$' "$MODEL_REPORT"; then
+            echo "A default model is unavailable; choosing substitutes with switch_models.py..."
+            {
+              echo
+              echo "# scripts/switch_models.py --region ${AWS::Region} --env-file /etc/launchpad-models.env"
+              (cd /home/ubuntu/agentcore_launchpad/backend \
+                && HOME=/root timeout 1200 /usr/local/bin/uv run --no-sync python \
+                   ../scripts/switch_models.py --region "${AWS::Region}" \
+                   --env-file /etc/launchpad-models.env) 2>&1
+            } >>"$MODEL_REPORT" \
+              || echo "WARNING: switch_models.py exited non-zero; read the end of $MODEL_REPORT." >&2
+          fi
+
+          # Publish the console. See the YAML comment above UserData.
+          STACK_UUID="$(printf '%s' "${AWS::StackId}" | awk -F/ '{print $3}')"
+          ADMIN_PASSWORD="$(printf '%s' "$STACK_UUID" | awk -F- '{print $1 $5}')"
+          ORIGIN_KEY="$(printf '%s' "$STACK_UUID" | awk -F- '{print $5 $1 $4}')"
+          pw() { printf '%s' "$STACK_UUID" | awk -F- "{print $1}"; }
+          DEV_PW="$(pw '$2 $3 $1')"; BIZ_PW="$(pw '$4 $3 $1')"
+          OPS_PW="$(pw '$2 $4 $1')"; SME_PW="$(pw '$3 $4 $1')"
+
+          APP=/home/ubuntu/agentcore_launchpad
+          UPATH=/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin
+          RUNAS="runuser -u ubuntu -- env HOME=/home/ubuntu PATH=$UPATH"
+
+          echo "Building the frontend bundle (vite preview serves dist/)..."
+          $RUNAS bash -c "cd $APP/frontend && npm run build"
+
+          # 0600 because it carries the password; the unit file itself is 0644.
+          install -m 0600 /dev/null /etc/launchpad-auth.env
+          cat >/etc/launchpad-auth.env <<ENV
+          LAUNCHPAD_AUTH_USERNAME=admin
+          LAUNCHPAD_AUTH_PASSWORD=$ADMIN_PASSWORD
+          LAUNCHPAD_RUN_MODE=prod
+          LAUNCHPAD_AUTH_COOKIE_SECURE=true
+          LAUNCHPAD_AUTH_REGISTRATION_ENABLED=true
+          LAUNCHPAD_AUTH_REGISTRATION_REQUIRE_APPROVAL=true
+          LAUNCHPAD_REGION=${AWS::Region}
+          AWS_REGION=${AWS::Region}
+          AWS_DEFAULT_REGION=${AWS::Region}
+          HOME=/home/ubuntu
+          PATH=$UPATH
+          ENV
+
+          cat >/etc/systemd/system/launchpad-backend.service <<UNIT
+          [Unit]
+          After=network-online.target
+          [Service]
+          User=ubuntu
+          WorkingDirectory=$APP/backend
+          EnvironmentFile=/etc/launchpad-auth.env
+          EnvironmentFile=-/etc/launchpad-models.env
+          ExecStart=/usr/local/bin/uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
+          Restart=on-failure
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+
+          install -m 0640 -o root -g www-data /dev/null /etc/nginx/sites-available/launchpad
+          cat >/etc/nginx/sites-available/launchpad <<NGINX
+          server {
+            listen 80 default_server;
+            if (\$http_x_launchpad_origin_key != "$ORIGIN_KEY") { return 403; }
+            client_max_body_size 64m;
+            location ~ ^/(api|v1|share)/ {
+              proxy_pass http://127.0.0.1:8000;
+              proxy_http_version 1.1;
+              proxy_buffering off;
+              proxy_read_timeout 3600s;
+              proxy_set_header Host \$host;
+              proxy_set_header X-Forwarded-Proto https;
+              proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+            }
+            location / {
+              root $APP/frontend/dist;
+              try_files \$uri /index.html;
+            }
+          }
+          NGINX
+          chmod 0640 /etc/nginx/sites-available/launchpad
+          chmod o+x /home/ubuntu /home/ubuntu/agentcore_launchpad \
+            /home/ubuntu/agentcore_launchpad/frontend
+
+          rm -f /etc/nginx/sites-enabled/default
+          ln -s /etc/nginx/sites-available/launchpad /etc/nginx/sites-enabled/launchpad
+          nginx -t
+          systemctl daemon-reload
+          systemctl enable --now launchpad-backend
+          systemctl restart nginx
+
+          echo "Waiting for the console to answer locally..."
+          UP=no
+          for _ in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/api/health >/dev/null 2>&1 \
+               && curl -fs -o /dev/null -H "X-Launchpad-Origin-Key: $ORIGIN_KEY" \
+                  http://127.0.0.1/ 2>/dev/null; then UP=yes; break; fi
+            sleep 5
+          done
+          # Fail closed: no console, or a console with the login gate off, must not ship.
+          if [ "$UP" != yes ] || ! curl -fs http://127.0.0.1:8000/api/auth/status \
+             | grep -q '"auth_required":true'; then
+            echo "Console down or auth gate off; refusing to publish." >&2
+            journalctl -u launchpad-backend --no-pager -n 40 >&2 || true
+            nginx -T 2>&1 | tail -5 >&2 || true
+            signal_failure
+            exit 1
+          fi
+
+          echo "Seeding workshop accounts..."
+          cat >/tmp/seed-users.py <<'SEED'
+          import json, sys, urllib.error, urllib.request
+          B = 'http://127.0.0.1:8000'
+          def call(method, path, body=None, cookie=None, workspace=None):
+              headers = {'Content-Type': 'application/json'}
+              if cookie:
+                  headers['Cookie'] = cookie
+              if workspace:
+                  headers['X-Workspace'] = workspace
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(B + path, data=data, method=method, headers=headers)
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  return resp.headers, json.loads(resp.read() or b'null')
+          head, _ = call('POST', '/api/auth/login', {'username': 'admin', 'password': sys.argv[1]})
+          cookie = next(c.split(';')[0] for c in head.get_all('Set-Cookie')
+                        if c.startswith('launchpad_session='))
+          for name, role, password, grant in json.loads(sys.argv[2]):
+              try:
+                  call('POST', '/api/auth/register', {'username': name, 'password': password,
+                       'email': name + '@example.com'}, cookie)
+              except urllib.error.HTTPError as exc:
+                  print('register', name, exc.code, exc.read()[:200])
+              _, found = call('GET', '/api/users?q=' + name, None, cookie)
+              uid = next(u['id'] for u in found['items'] if u['username'] == name)
+              call('PATCH', '/api/users/' + uid, {'status': 'active', 'role': role,
+                   'expires_at': None, 'workspaces': ['default'],
+                   'permissions': {k: True for k in grant}}, cookie)
+              print('seeded', name, role, sorted(grant))
+          # The flywheel needs gated releases from the first deploy on; participants
+          # have no AWS access, so the organiser's stack sets it, not a lab step.
+          call('PUT', '/api/release-policies/default', {
+              'release_mode': 'gated',
+              'calibration': {'period_days': 30, 'kappa_floor': 0.6},
+              'eval_cost_confirm_usd': 5, 'eval_cost_max_usd': 20}, cookie, 'default')
+          print('release policy: gated')
+          # The flywheel hands one agent from developer to biz-owner, release-ops
+          # and sme, so every member must see what another member created. Shared
+          # is the default; pin it so the labs never run on an isolated workspace.
+          try:
+              call('PUT', '/api/workspaces/default/settings/visibility',
+                   {'resource_visibility': 'shared'}, cookie, 'default')
+              print('member visibility: shared')
+          except urllib.error.HTTPError as exc:
+              print('member visibility', exc.code, exc.read()[:200])
+          SEED
+          python3 /tmp/seed-users.py "$ADMIN_PASSWORD" "$(jq -nc \
+            --arg dev "$DEV_PW" --arg biz "$BIZ_PW" --arg ops "$OPS_PW" --arg sme "$SME_PW" '[
+            ["developer","member",$dev,["criteria.manage","agents.deploy","eval.run"]],
+            ["biz-owner","member",$biz,["criteria.sign","golden.admit","judge.calibrate"]],
+            ["release-ops","operator",$ops,["release.sign","waiver.approve"]],
+            ["sme","member",$sme,[]]]')"
+          rm -f /tmp/seed-users.py
+          if [ "${SelfRegistration}" = Disabled ]; then
+            sed -i 's/^LAUNCHPAD_AUTH_REGISTRATION_ENABLED=true$/LAUNCHPAD_AUTH_REGISTRATION_ENABLED=false/' /etc/launchpad-auth.env
+            systemctl restart launchpad-backend
+            for _ in $(seq 1 60); do
+              curl -fsS http://127.0.0.1:8000/api/health >/dev/null 2>&1 && break
+              sleep 5
+            done
+          fi
+
+          cat >/home/ubuntu/WORKSHOP-READY.txt <<READY
+          Ready. Hand each team its ConsoleUrl and the five passwords from the
+          stack Outputs; participants open ConsoleUrl/v3 in a browser and sign
+          in with the account the chapter names (admin, developer, biz-owner,
+          release-ops, sme). They need no AWS access and no shell.
+
+          Models: /home/ubuntu/MODEL-ACCESS.txt
+          Boot:   /var/log/workshop-bootstrap.log
+          Status: systemctl status launchpad-backend nginx
+          READY
+          chown ubuntu:ubuntu /home/ubuntu/WORKSHOP-READY.txt
+
+          signal_stack SUCCESS
+          trap - ERR
+
+Outputs:
+  ConsoleUrl:
+    Description: >
+      Hand this to the team: participants open ConsoleUrl/v3 in a browser and
+      sign in. They need no AWS account access, AWS CLI or SSM.
+    Value: !Sub "https://${ConsoleDistribution.DomainName}"
+  ConsoleUsername:
+    Description: Console sign-in username.
+    Value: admin
+  ConsolePassword:
+    Description: >
+      Password of the console account `admin` (see ConsoleUsername), derived
+      from the stack id so each team's stack gets its own.
+    Value: !Join
+      - ""
+      - - !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+  ConsoleAccounts:
+    Description: >
+      Seeded console accounts (username / role). Each has its own password output.
+    Value: admin (platform admin) | developer (member, builds and requests release) | biz-owner (member, signs criteria, admits golden cases, certifies judges) | release-ops (operator, signs releases and approves waivers) | sme (member, annotator)
+  DeveloperPassword:
+    Description: Password for the developer account.
+    Value: !Join
+      - ""
+      - - !Select [1, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - !Select [2, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+  BizOwnerPassword:
+    Description: Password for the biz-owner account.
+    Value: !Join
+      - ""
+      - - !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - !Select [2, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+  ReleaseOpsPassword:
+    Description: Password for the release-ops account.
+    Value: !Join
+      - ""
+      - - !Select [1, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+  SmePassword:
+    Description: Password for the sme account.
+    Value: !Join
+      - ""
+      - - !Select [2, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - !Select [3, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+        - !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+  InstanceId:
+    Description: EC2 instance used for all workshop exercises.
+    Value: !Ref WorkshopInstance
+  SessionManagerUrl:
+    Description: Open this URL to start a browser-based shell on the instance.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/systems-manager/session-manager/${WorkshopInstance}?region=${AWS::Region}"
+  SessionManagerCommand:
+    Description: AWS CLI command to start an interactive shell.
+    Value: !Sub "aws ssm start-session --target ${WorkshopInstance} --region ${AWS::Region}"
+  RepositoryPath:
+    Description: Location of the cloned AgentCore Launchpad repository.
+    Value: /home/ubuntu/agentcore_launchpad
+  BootstrapLog:
+    Description: Command for monitoring instance setup.
+    Value: sudo tail -n 200 /var/log/workshop-bootstrap.log
