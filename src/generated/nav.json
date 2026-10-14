@@ -113,6 +113,12 @@
             "title": "生产集成：业务系统如何调用 AgentCore 上的 Agent",
             "weight": 20,
             "children": []
+          },
+          {
+            "route": "90-appendix/30-glossary",
+            "title": "术语表",
+            "weight": 30,
+            "children": []
           }
         ]
       }
@@ -231,6 +237,12 @@
             "route": "90-appendix/20-production-integration",
             "title": "Production integration: how business systems call an agent on AgentCore",
             "weight": 20,
+            "children": []
+          },
+          {
+            "route": "90-appendix/30-glossary",
+            "title": "Glossary",
+            "weight": 30,
             "children": []
           }
         ]
