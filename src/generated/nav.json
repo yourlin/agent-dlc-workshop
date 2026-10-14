@@ -99,13 +99,19 @@
       },
       {
         "route": "90-appendix",
-        "title": "附录：组织方",
+        "title": "附录",
         "weight": 90,
         "children": [
           {
             "route": "90-appendix/10-organizer-deploy",
             "title": "组织方部署指南",
             "weight": 10,
+            "children": []
+          },
+          {
+            "route": "90-appendix/20-production-integration",
+            "title": "生产集成：业务系统如何调用 AgentCore 上的 Agent",
+            "weight": 20,
             "children": []
           }
         ]
@@ -212,13 +218,19 @@
       },
       {
         "route": "90-appendix",
-        "title": "Appendix: for the Organiser",
+        "title": "Appendix",
         "weight": 90,
         "children": [
           {
             "route": "90-appendix/10-organizer-deploy",
             "title": "Organizer deployment guide",
             "weight": 10,
+            "children": []
+          },
+          {
+            "route": "90-appendix/20-production-integration",
+            "title": "Production integration: how business systems call an agent on AgentCore",
+            "weight": 20,
             "children": []
           }
         ]
