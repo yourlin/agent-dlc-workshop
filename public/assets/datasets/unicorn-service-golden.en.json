@@ -3,7 +3,7 @@
     "scenario_id": "kg-01",
     "turns": [
       {
-        "input": "I signed for a jacket on 3 October; the tags are still on and I haven't worn it. Today is 8 October. Can I still use the 7-day no-reason return?",
+        "input": "I signed for a jacket on 3 October; the tags are still on and I haven't worn it. If I request it on 8 October, can I still use the 7-day no-reason return?",
         "expected_response": "Yes. The 7 days count from the day after sign-off (4 October), so you can request the return up to and including 10 October. The jacket must be unworn with tags, packaging and accessories complete. Return shipping for a non-quality return is paid by the buyer; if the order has return-shipping insurance, up to ¥12 is reimbursed to Unicorn Wallet."
       }
     ],
@@ -359,7 +359,7 @@
     "scenario_id": "kg-14",
     "turns": [
       {
-        "input": "I paid for a rice cooker on 5 October. Today, 8 October, the same item is ¥50 cheaper. Can I get the difference back?",
+        "input": "I paid for a rice cooker on 5 October. On 8 October the same item became ¥50 cheaper, and I applied the same day. Can I get the difference back?",
         "expected_response": "Yes, through price protection. Within 7 days of payment, if the same item's price on Unicorn Mall drops (flash-sale and live-stream-exclusive prices excluded), the ¥50 difference is refunded to Unicorn Wallet, once per item per order."
       }
     ],
