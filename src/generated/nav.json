@@ -32,6 +32,12 @@
             "title": "组队与分工",
             "weight": 40,
             "children": []
+          },
+          {
+            "route": "10-prepare/50-platform-config",
+            "title": "平台配置",
+            "weight": 50,
+            "children": []
           }
         ]
       },
@@ -119,6 +125,12 @@
             "title": "术语表",
             "weight": 30,
             "children": []
+          },
+          {
+            "route": "90-appendix/40-platform-ops",
+            "title": "平台运维：在线更新、单点登录与私有网络",
+            "weight": 40,
+            "children": []
           }
         ]
       }
@@ -156,6 +168,12 @@
             "route": "10-prepare/40-teams",
             "title": "Teams and Roles",
             "weight": 40,
+            "children": []
+          },
+          {
+            "route": "10-prepare/50-platform-config",
+            "title": "Platform configuration",
+            "weight": 50,
             "children": []
           }
         ]
@@ -197,7 +215,7 @@
           },
           {
             "route": "20-flywheel/60-feedback",
-            "title": "Phase 6 · Feed Back: Make the Next Round Stronger",
+            "title": "Phase 6 · Improve: Make the Next Round Stronger",
             "weight": 60,
             "children": []
           }
@@ -243,6 +261,12 @@
             "route": "90-appendix/30-glossary",
             "title": "Glossary",
             "weight": 30,
+            "children": []
+          },
+          {
+            "route": "90-appendix/40-platform-ops",
+            "title": "Platform operations: online update, single sign-on and private networking",
+            "weight": 40,
             "children": []
           }
         ]

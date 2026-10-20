@@ -60,22 +60,39 @@ Parameters:
     Type: String
     Default: ""
     Description: >
-      Leave empty to let the stack create its own VPC, public subnet, internet
-      gateway and route table. To deploy into an existing VPC instead, give its
-      id here (DNS hostnames and DNS resolution must both be enabled) and set
-      ExistingSubnetId too.
+      Leave empty (recommended) to let the stack build a private network: one
+      public subnet holding only the NAT gateway, two private subnets in
+      AgentCore-supported Availability Zones for the console and the agents,
+      interface endpoints for the AWS services, an S3 gateway endpoint and an
+      S3 Files file system. To use an existing VPC instead, give its id and
+      ExistingSubnetId, and prepare the VPC first as the organiser appendix
+      "Deploy into an existing VPC" describes; the stack then creates only the
+      console instance, its security group and the CloudFront VPC origin.
     AllowedPattern: "^$|^vpc-[0-9a-f]{8,17}$"
     ConstraintDescription: Empty, or a VPC id such as vpc-0123456789abcdef0.
   ExistingSubnetId:
     Type: String
     Default: ""
     Description: >
-      Required when ExistingVpcId is set, empty otherwise. A public subnet of
-      that VPC: its route table sends 0.0.0.0/0 to an internet gateway, and its
-      Availability Zone offers the chosen InstanceType. The instance gets a
-      public IPv4 address regardless of the subnet's auto-assign setting.
+      Required when ExistingVpcId is set, empty otherwise. A PRIVATE subnet of
+      that VPC for the console instance: outbound 0.0.0.0/0 through a NAT
+      gateway (bootstrap downloads packages), and its Availability Zone offers
+      the chosen InstanceType. The instance gets no public IP; CloudFront
+      reaches it through a VPC origin, which needs an internet gateway attached
+      to the VPC.
     AllowedPattern: "^$|^subnet-[0-9a-f]{8,17}$"
     ConstraintDescription: Empty, or a subnet id such as subnet-0123456789abcdef0.
+  CreateEfs:
+    Type: String
+    Default: Disabled
+    AllowedValues:
+      - Disabled
+      - Enabled
+    Description: >
+      Enabled also creates an encrypted Amazon EFS file system with a mount
+      target in each private subnet and an access point, as a second storage
+      kind beside the S3 Files file system the stack always creates. Needs the
+      stack's own VPC (ExistingVpcId empty).
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -97,11 +114,14 @@ Metadata:
         Parameters:
           - ExistingVpcId
           - ExistingSubnetId
+          - CreateEfs
     ParameterLabels:
+      CreateEfs:
+        default: Also create an EFS file system (optional storage kind)
       ExistingVpcId:
-        default: Existing VPC id (leave empty to create a new VPC)
+        default: Existing VPC id (leave empty to create the private network)
       ExistingSubnetId:
-        default: Existing public subnet id (required with an existing VPC)
+        default: Existing private subnet id for the console (required with an existing VPC)
 
 Rules:
   ExistingNetworkIsComplete:
@@ -116,12 +136,31 @@ Rules:
         # Single-line plain scalar: a folded block would put a trailing newline
         # into the stack event message.
         AssertDescription: Set ExistingVpcId and ExistingSubnetId together (deploy into an existing VPC), or leave both empty (the stack creates its own network).
+  EfsNeedsOwnVpc:
+    RuleCondition: !Equals [!Ref CreateEfs, Enabled]
+    Assertions:
+      - Assert: !Equals [!Ref ExistingVpcId, ""]
+        AssertDescription: CreateEfs=Enabled puts its mount targets in the stack's own private subnets; leave ExistingVpcId and ExistingSubnetId empty.
 
 Conditions:
   CreateInstanceRole: !Equals [!Ref ParticipantRoleArn, ""]
   CreateVpc: !Equals [!Ref ExistingVpcId, ""]
+  CreateEfsStorage: !And
+    - !Condition CreateVpc
+    - !Equals [!Ref CreateEfs, Enabled]
 
 Mappings:
+  # AgentCore VPC mode runs only in some Availability Zones, named by zone ID
+  # (the zone-name-to-ID mapping differs per account). The console's network
+  # preflight blocks a subnet anywhere else, so the private subnets pin two of
+  # them. Source: backend/app/core/regions.py AGENTCORE_VPC_AZ_IDS.
+  AgentCoreAzIds:
+    us-east-1:
+      A: use1-az1
+      B: use1-az2
+    us-west-2:
+      A: usw2-az1
+      B: usw2-az2
   # com.amazonaws.global.cloudfront.origin-facing, so port 80 on the instance is
   # reachable from CloudFront edges only and not from the open internet. The id
   # is per-region and there is no pseudo-parameter for it, so the two regions
@@ -218,14 +257,526 @@ Resources:
           Value: agentcore-launchpad-workshop
 
   # The bootstrap needs the internet from its first command, so the instance
-  # must wait for the default route when the stack builds the network. A plain
-  # DependsOn cannot name a resource whose condition is false; this free,
-  # never-signalled handle carries that dependency only when CreateVpc holds.
+  # must wait for its private subnet's route to the NAT gateway when the stack
+  # builds the network. A plain DependsOn cannot name a resource whose
+  # condition is false; this free, never-signalled handle carries that
+  # dependency only when CreateVpc holds.
   NetworkReady:
     Type: AWS::CloudFormation::WaitConditionHandle
     Metadata:
       DefaultRoute: !If [CreateVpc, !Ref DefaultRoute, ""]
       RouteTableAssociation: !If [CreateVpc, !Ref PublicSubnetRouteTableAssociation, ""]
+      PrivateRoute: !If [CreateVpc, !Ref PrivateDefaultRoute, ""]
+      PrivateAssociation: !If [CreateVpc, !Ref PrivateSubnetARouteTableAssociation, ""]
+      # seed_workshop_env.py registers these before the stack completes
+      AgentSecurityGroup: !If [CreateVpc, !Ref AgentSecurityGroup, ""]
+      FilesAccessPoint: !If [CreateVpc, !Ref FilesAccessPoint, ""]
+      FilesMountTargetA: !If [CreateVpc, !Ref FilesMountTargetA, ""]
+      FilesMountTargetB: !If [CreateVpc, !Ref FilesMountTargetB, ""]
+      EfsAccessPoint: !If [CreateEfsStorage, !Ref EfsAccessPoint, ""]
+      EfsMountTargetA: !If [CreateEfsStorage, !Ref EfsMountTargetA, ""]
+      EfsMountTargetB: !If [CreateEfsStorage, !Ref EfsMountTargetB, ""]
+
+  # ── Private network (default; skipped with ExistingVpcId) ──────────────────
+  # Layout: the public subnet holds only the NAT gateway. The console instance
+  # and every AgentCore runtime live in the two private subnets, pinned to
+  # AgentCore-supported AZ ids. AWS service traffic stays inside the VPC
+  # through interface endpoints (private DNS) and the S3 gateway endpoint; the
+  # NAT gateway is the path to the public internet only (package installs at
+  # bootstrap, public MCP servers / PyPI / third-party APIs for agents) and
+  # for AWS services without an endpoint here (IAM, CloudFormation, ...).
+  # The console registers none of this itself: the bootstrap seeds a network
+  # profile and storage entries from these ids (outputs Agent* / Files*).
+  NatEip:
+    Type: AWS::EC2::EIP
+    Condition: CreateVpc
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop-nat
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateVpc
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      AvailabilityZoneId: !FindInMap [AgentCoreAzIds, !Ref "AWS::Region", A]
+      CidrBlock: 10.42.10.0/24
+      VpcId: !Ref WorkshopVpc
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop-private-a
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: CreateVpc
+    Properties:
+      AvailabilityZoneId: !FindInMap [AgentCoreAzIds, !Ref "AWS::Region", B]
+      CidrBlock: 10.42.11.0/24
+      VpcId: !Ref WorkshopVpc
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop-private-b
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateVpc
+    Properties:
+      VpcId: !Ref WorkshopVpc
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop-private
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: CreateVpc
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetA
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateVpc
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnetB
+
+  # Free; keeps S3 traffic (zip artifacts, ECR image layers, skills, KB
+  # documents, S3 Files sync) off the NAT gateway.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      VpcId: !Ref WorkshopVpc
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+        - !Ref PublicRouteTable
+
+  # Interface endpoints admit 443 from anywhere in the VPC: the console
+  # instance and every agent security group resolve the service names to them
+  # (private DNS is VPC-wide), and the network preflight accepts a VPC-CIDR rule.
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVpc
+    Properties:
+      GroupDescription: Interface VPC endpoints, HTTPS from inside the VPC only.
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.42.0.0/16
+          Description: HTTPS from the console and AgentCore runtimes
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.42.0.0/16
+          Description: Replies inside the VPC
+      VpcId: !Ref WorkshopVpc
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop-endpoints
+
+  # The endpoint matrix of backend/app/services/network_preflight.py
+  # (ENDPOINT_MATRIX: ecr.api, ecr.dkr, logs, bedrock-runtime,
+  # bedrock-agentcore, bedrock-agent-runtime, xray, secretsmanager, sts), plus
+  # the three Session Manager endpoints so the organiser's shell does not
+  # depend on the NAT gateway. Each is billed per endpoint per AZ-hour.
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  BedrockRuntimeEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.bedrock-runtime"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  BedrockAgentCoreEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.bedrock-agentcore"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # The bedrock-agentcore endpoint's private DNS zone also answers for every
+  # name under it, so without this endpoint `<id>.gateway.bedrock-agentcore...`
+  # does not resolve in the VPC and a VPC-mode harness cannot load a gateway
+  # tool (a mounted knowledge base is one).
+  BedrockAgentCoreGatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.bedrock-agentcore.gateway"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  BedrockAgentRuntimeEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.bedrock-agent-runtime"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  XrayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.xray"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.secretsmanager"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  StsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.sts"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  SsmEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  SsmMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  Ec2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateVpc
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      VpcId: !Ref WorkshopVpc
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref EndpointSecurityGroup]
+
+  # The network profile's security group. Nothing calls into an agent session,
+  # so no ingress; egress covers 443 (AWS APIs via NAT) and 2049 (NFS to the
+  # mount targets), the two rules the network and storage preflights check.
+  AgentSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVpc
+    Properties:
+      GroupDescription: AgentCore runtimes in the private subnets, outbound only.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: AWS APIs and model endpoints through the NAT gateway
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 10.42.0.0/16
+          Description: NFS to the S3 Files mount targets
+      VpcId: !Ref WorkshopVpc
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop-agents
+
+  FileMountSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: CreateVpc
+    Properties:
+      GroupDescription: S3 Files mount targets, NFS from the agent security group only.
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref AgentSecurityGroup
+          Description: NFS from AgentCore runtimes
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: 10.42.0.0/16
+          Description: NFS replies inside the VPC
+      VpcId: !Ref WorkshopVpc
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop-files
+
+  # S3 Files requires versioning and SSE-S3/SSE-KMS on the source bucket. The
+  # name starts with launchpad- so the instance role's existing s3:* grant
+  # covers it. Retained on stack deletion, like every bucket a participant may
+  # have written into: the organiser empties and deletes it by hand (the name
+  # is in the FilesBucketName output).
+  FilesBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateVpc
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Join
+        - "-"
+        - - launchpad-files
+          - !Ref AWS::AccountId
+          - !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # The role S3 Files assumes to sync the file system with the bucket. Trust and
+  # policy follow the S3 Files prerequisites page ("IAM role for accessing your
+  # bucket from the file system"); no KMS statement, the bucket uses SSE-S3.
+  FilesSyncRole:
+    Type: AWS::IAM::Role
+    Condition: CreateVpc
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticfilesystem.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:s3files:${AWS::Region}:${AWS::AccountId}:file-system/*"
+      Policies:
+        - PolicyName: s3files-sync
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:ListBucketVersions]
+                Resource: !GetAtt FilesBucket.Arn
+                Condition: {StringEquals: {aws:ResourceAccount: !Ref AWS::AccountId}}
+              - Effect: Allow
+                Action: [s3:AbortMultipartUpload, s3:DeleteObject*, s3:GetObject*, s3:List*, s3:PutObject*]
+                Resource: !Sub "${FilesBucket.Arn}/*"
+                Condition: {StringEquals: {aws:ResourceAccount: !Ref AWS::AccountId}}
+              - Effect: Allow
+                Action: [events:DeleteRule, events:DisableRule, events:EnableRule, events:PutRule, events:PutTargets, events:RemoveTargets]
+                Resource: !Sub "arn:${AWS::Partition}:events:*:*:rule/DO-NOT-DELETE-S3-Files*"
+                Condition: {StringEquals: {events:ManagedBy: elasticfilesystem.amazonaws.com}}
+              - Effect: Allow
+                Action: [events:DescribeRule, events:ListRuleNamesByTarget, events:ListRules, events:ListTargetsByRule]
+                Resource: !Sub "arn:${AWS::Partition}:events:*:*:rule/*"
+
+  FilesFileSystem:
+    Type: AWS::S3Files::FileSystem
+    Condition: CreateVpc
+    Properties:
+      Bucket: !GetAtt FilesBucket.Arn
+      RoleArn: !GetAtt FilesSyncRole.Arn
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop
+
+  # One mount target in each private subnet's AZ: the storage preflight blocks
+  # a profile subnet whose AZ has none (the session would time out mounting).
+  FilesMountTargetA:
+    Type: AWS::S3Files::MountTarget
+    Condition: CreateVpc
+    Properties:
+      FileSystemId: !GetAtt FilesFileSystem.FileSystemId
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups:
+        - !Ref FileMountSecurityGroup
+
+  FilesMountTargetB:
+    Type: AWS::S3Files::MountTarget
+    Condition: CreateVpc
+    Properties:
+      FileSystemId: !GetAtt FilesFileSystem.FileSystemId
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups:
+        - !Ref FileMountSecurityGroup
+
+  FilesAccessPoint:
+    Type: AWS::S3Files::AccessPoint
+    Condition: CreateVpc
+    Properties:
+      FileSystemId: !GetAtt FilesFileSystem.FileSystemId
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /workshop
+        CreationPermissions:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "755"
+      Tags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop
+
+  # CreateEfs=Enabled: the second storage kind the console can register.
+  WorkshopEfs:
+    Type: AWS::EFS::FileSystem
+    Condition: CreateEfsStorage
+    DeletionPolicy: Delete
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: elastic
+      FileSystemTags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop
+
+  EfsMountTargetA:
+    Type: AWS::EFS::MountTarget
+    Condition: CreateEfsStorage
+    Properties:
+      FileSystemId: !Ref WorkshopEfs
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroups: [!Ref FileMountSecurityGroup]
+
+  EfsMountTargetB:
+    Type: AWS::EFS::MountTarget
+    Condition: CreateEfsStorage
+    Properties:
+      FileSystemId: !Ref WorkshopEfs
+      SubnetId: !Ref PrivateSubnetB
+      SecurityGroups: [!Ref FileMountSecurityGroup]
+
+  EfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Condition: CreateEfsStorage
+    Properties:
+      FileSystemId: !Ref WorkshopEfs
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        Path: /workshop
+        CreationInfo:
+          OwnerUid: "1000"
+          OwnerGid: "1000"
+          Permissions: "755"
+      AccessPointTags:
+        - Key: Name
+          Value: agentcore-launchpad-workshop
+
+  # CloudFront reaches the private instance through a service-managed ENI in
+  # its subnet. http-only: there is no certificate on the instance; the hop
+  # stays inside the VPC, the security group admits only the CloudFront
+  # origin-facing prefix list, and nginx still demands the secret header the
+  # distribution injects. Created after the instance signals (it must be
+  # running), and takes up to ~15 minutes to deploy.
+  ConsoleVpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Properties:
+      VpcOriginEndpointConfig:
+        Name: !Sub "${AWS::StackName}-console"
+        Arn: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${WorkshopInstance}"
+        HTTPPort: 80
+        HTTPSPort: 443
+        OriginProtocolPolicy: http-only
 
   # CloudFront gives the console a trusted HTTPS name with no certificate to
   # manage. It is not an optimisation: prod mode marks the session cookie
@@ -257,14 +808,10 @@ Resources:
         HttpVersion: http2
         Origins:
           - Id: launchpad-instance
-            DomainName: !GetAtt WorkshopInstance.PublicDnsName
-            CustomOriginConfig:
-              # http-only: there is no certificate on the instance. The hop from
-              # the edge to the origin is cleartext inside AWS, which is why the
-              # security group admits CloudFront ranges only and nginx demands
-              # the secret header below.
-              OriginProtocolPolicy: http-only
-              HTTPPort: 80
+            # A VPC origin addresses an EC2 instance by its private DNS name.
+            DomainName: !GetAtt WorkshopInstance.PrivateDnsName
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt ConsoleVpcOrigin.Id
               OriginReadTimeout: 60
               OriginKeepaliveTimeout: 5
             OriginCustomHeaders:
@@ -287,6 +834,31 @@ Resources:
           # Managed-AllViewer: forwards every header, cookie and query string,
           # which the session cookie and SSE streams both need.
           OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+
+  # The backend builds its public URLs (SSO SP entity ID / ACS URL, OIDC callback,
+  # SCIM base, the as_user OAuth return URL) from LAUNCHPAD_PUBLIC_BASE_URL. The
+  # instance cannot know the CloudFront domain while it boots — the distribution
+  # uses the instance as its origin, so it is created after the instance — so once
+  # the distribution exists, Run Command writes the domain to its own env file
+  # (the unit reads it with EnvironmentFile=-) and restarts the backend if it is
+  # running. A separate file, so nothing that rewrites /etc/launchpad-auth.env can
+  # drop it. Runs once, at stack creation, without holding the stack: it needs the
+  # instance's SSM agent registered, which the stack's own instance role allows
+  # (AmazonSSMManagedInstanceCore); with a ParticipantRoleArn lacking SSM it stays
+  # pending and the organiser sets the URL by hand (Platform operations appendix).
+  PublicBaseUrlAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub "${AWS::StackName}-public-base-url"
+      Name: AWS-RunShellScript
+      Targets:
+        - Key: InstanceIds
+          Values: [!Ref WorkshopInstance]
+      Parameters:
+        commands:
+          - !Sub "echo LAUNCHPAD_PUBLIC_BASE_URL=https://${ConsoleDistribution.DomainName} > /etc/launchpad-public.env"
+          - chmod 0644 /etc/launchpad-public.env
+          - "systemctl try-restart launchpad-backend || true"
 
   # Created only when the customer deploys the stack (no ParticipantRoleArn): the
   # same permissions Workshop Studio grants its participant role
@@ -326,6 +898,8 @@ Resources:
               - {"Sid": "PassLaunchpadAndCdkRolesToRequiredServices", "Effect": "Allow", "Action": "iam:PassRole", "Resource": ["arn:aws:iam::*:role/launchpad-*", "arn:aws:iam::*:role/cdk-*", "arn:aws:iam::*:role/hnb659fds-*"], "Condition": {"StringEquals": {"iam:PassedToService": ["bedrock.amazonaws.com", "bedrock-agentcore.amazonaws.com", "cloudformation.amazonaws.com", "codebuild.amazonaws.com", "lambda.amazonaws.com"]}}}
               - {"Sid": "CreateRequiredServiceLinkedRoles", "Effect": "Allow", "Action": "iam:CreateServiceLinkedRole", "Resource": "*", "Condition": {"StringLike": {"iam:AWSServiceName": ["agent-registry.amazonaws.com", "application-signals.cloudwatch.amazonaws.com", "bedrock-agentcore.amazonaws.com", "identity-network.bedrock-agentcore.amazonaws.com", "network.bedrock-agentcore.amazonaws.com", "runtime-identity.bedrock-agentcore.amazonaws.com"]}}}
               - {"Sid": "AgentCoreEncryption", "Effect": "Allow", "Action": ["kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey", "kms:ListAliases", "kms:ListKeys"], "Resource": "*"}
+              - {"Sid": "CostExplorerByTag", "Effect": "Allow", "Action": ["ce:GetCostAndUsage", "ce:ListCostAllocationTags", "ce:UpdateCostAllocationTagsStatus"], "Resource": "*"}
+              - {"Sid": "StorageMountPreflight", "Effect": "Allow", "Action": ["elasticfilesystem:DescribeAccessPoints", "elasticfilesystem:DescribeFileSystems", "elasticfilesystem:DescribeMountTargetSecurityGroups", "elasticfilesystem:DescribeMountTargets", "s3files:GetAccessPoint", "s3files:GetFileSystem", "s3files:GetMountTarget", "s3files:ListAccessPoints", "s3files:ListMountTargets"], "Resource": "*"}
               - {"Sid": "ReadUbuntuAmiParameter", "Effect": "Allow", "Action": ["ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath"], "Resource": "arn:aws:ssm:*::parameter/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id"}
               - {"Sid": "ManageCdkBootstrapParameter", "Effect": "Allow", "Action": ["ssm:AddTagsToResource", "ssm:DeleteParameter", "ssm:GetParameter", "ssm:GetParameters", "ssm:GetParametersByPath", "ssm:ListTagsForResource", "ssm:PutParameter", "ssm:RemoveTagsFromResource"], "Resource": "arn:aws:ssm:*:*:parameter/cdk-bootstrap/*"}
               - {"Sid": "UseSessionManager", "Effect": "Allow", "Action": ["ssm:DescribeInstanceInformation", "ssm:ResumeSession", "ssm:StartSession", "ssm:TerminateSession"], "Resource": "*"}
@@ -395,16 +969,16 @@ Resources:
             Encrypted: true
             VolumeSize: !Ref RootVolumeSize
             VolumeType: gp3
-      # AssociatePublicIpAddress makes the public IPv4 (and with it the
-      # PublicDnsName that CloudFront uses as origin) independent of the
-      # subnet's MapPublicIpOnLaunch, which matters for an existing subnet.
+      # Private subnet, no public IP: the only way in is the CloudFront VPC
+      # origin (ConsoleVpcOrigin). Outbound goes to the VPC endpoints and,
+      # for the internet, the NAT gateway.
       NetworkInterfaces:
-        - AssociatePublicIpAddress: true
+        - AssociatePublicIpAddress: false
           DeleteOnTermination: true
           DeviceIndex: "0"
           GroupSet:
             - !Ref WorkshopSecurityGroup
-          SubnetId: !If [CreateVpc, !Ref PublicSubnet, !Ref ExistingSubnetId]
+          SubnetId: !If [CreateVpc, !Ref PrivateSubnetA, !Ref ExistingSubnetId]
       Tags:
         - Key: Name
           Value: agentcore-launchpad-workshop
@@ -443,6 +1017,13 @@ Resources:
       #     *Password output. Roles follow backend/scripts/e2e_agent_dlc.py:
       #     separation of duties is checked by username, so each sign-off step
       #     needs a different account from the one that requested it.
+      #  7. Install the online updater (backend/scripts/install_updater.sh), so
+      #     the System update page can apply a new release from the console.
+      #     Best effort: a failure is a warning, the console works without it.
+      #  8. Seed the network profile workshop-private and the storage entries
+      #     (backend/scripts/seed_workshop_env.py, ids read from this stack) and
+      #     make them the default project's defaults, so participants pick a
+      #     template rather than VPC ids. Skipped with ExistingVpcId.
       #
       # The model probe fails the stack only when no Bedrock Converse model
       # answers, since GLM-5.3 (every lab agent) and GPT-6 Sol (every evaluator
@@ -696,6 +1277,7 @@ Resources:
           WorkingDirectory=$APP/backend
           EnvironmentFile=/etc/launchpad-auth.env
           EnvironmentFile=-/etc/launchpad-models.env
+          EnvironmentFile=-/etc/launchpad-public.env
           ExecStart=/usr/local/bin/uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
           Restart=on-failure
           RestartSec=5
@@ -827,6 +1409,13 @@ Resources:
           READY
           chown ubuntu:ubuntu /home/ubuntu/WORKSHOP-READY.txt
 
+          $APP/backend/scripts/install_updater.sh --user ubuntu --services launchpad-backend \
+            || echo "WARNING: online updater not installed; see docs/upgrade.md." >&2
+          (cd $APP/backend && LAUNCHPAD_SEED_PASSWORD="$ADMIN_PASSWORD" HOME=/root \
+            /usr/local/bin/uv run --no-sync python scripts/seed_workshop_env.py \
+            --stack "${AWS::StackName}" --region "${AWS::Region}") \
+            || echo "WARNING: network profile / storage not seeded; register them by hand." >&2
+
           signal_stack SUCCESS
           trap - ERR
 
@@ -894,3 +1483,27 @@ Outputs:
   BootstrapLog:
     Description: Command for monitoring instance setup.
     Value: sudo tail -n 200 /var/log/workshop-bootstrap.log
+  AgentVpcId:
+    Condition: CreateVpc
+    Description: VPC for the network profile (/v3/network).
+    Value: !Ref WorkshopVpc
+  AgentSubnetIds:
+    Condition: CreateVpc
+    Description: The two private subnets for the network profile (internet = NAT).
+    Value: !Join [",", [!Ref PrivateSubnetA, !Ref PrivateSubnetB]]
+  AgentSecurityGroupId:
+    Condition: CreateVpc
+    Description: Security group for the network profile.
+    Value: !Ref AgentSecurityGroup
+  FilesAccessPointArn:
+    Condition: CreateVpc
+    Description: S3 Files access point ARN to register in the storage catalog (/v3/storage).
+    Value: !GetAtt FilesAccessPoint.AccessPointArn
+  FilesBucketName:
+    Condition: CreateVpc
+    Description: Bucket behind the S3 Files file system. Retained when the stack is deleted; empty and delete it by hand.
+    Value: !Ref FilesBucket
+  EfsAccessPointArn:
+    Condition: CreateEfsStorage
+    Description: EFS access point ARN (CreateEfs=Enabled), registered as storage workshop-efs.
+    Value: !GetAtt EfsAccessPoint.Arn
