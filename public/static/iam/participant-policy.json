@@ -219,6 +219,22 @@
       "Resource": "*"
     },
     {
+      "Sid": "StorageMountPreflight",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:DescribeAccessPoints",
+        "elasticfilesystem:DescribeFileSystems",
+        "elasticfilesystem:DescribeMountTargetSecurityGroups",
+        "elasticfilesystem:DescribeMountTargets",
+        "s3files:GetAccessPoint",
+        "s3files:GetFileSystem",
+        "s3files:GetMountTarget",
+        "s3files:ListAccessPoints",
+        "s3files:ListMountTargets"
+      ],
+      "Resource": "*"
+    },
+    {
       "Sid": "ReadUbuntuAmiParameter",
       "Effect": "Allow",
       "Action": [
